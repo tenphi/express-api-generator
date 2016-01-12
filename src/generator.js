@@ -1,27 +1,74 @@
 let Promise = require('bluebird');
+let _ = require('lodash');
+
+function getPathByName(ctrlName) {
+  return _.snakeCase(ctrlName.replace(/Ctrl$/, '').replace(/Controller$/, ''));
+}
 
 function getParamNames(fn) {
   var funStr = fn.toString();
   return funStr.slice(funStr.indexOf('(') + 1, funStr.indexOf(')')).match(/([^\s,]+)/g);
 }
 
+let moduleName = 'express-api-generator';
+
 let log = {
-  info: (...args) => console.log('tnp-router:', ...args),
-  warn: (...args) => console.warn('tnp-router:', ...args),
+  info: (...args) => console.log(moduleName + ':', ...args),
+  warn: (...args) => console.warn(moduleName + ':', ...args),
   error: (...args) => {
-    console.error('tnp-router:', ...args);
-    return 'tnp-router: ' + args.map( arg => JSON.stringify(arg) ).join(', ');
+    console.error(moduleName + ':', ...args);
+    return moduleName + ': ' + args.map( arg => JSON.stringify(arg) ).join(', ');
   },
-  debug: (...args) => console.log('tnp-router:', ...args)
+  debug: (...args) => console.log(moduleName + ':', ...args)
 };
 
-let methodMap = {
+let replaceMap = {
   getAll: 'get',
   get: 'get',
+  find: 'search',
   create: 'post',
-  update: 'put',
+  delete: 'delete',
+  update: 'put'
+};
+
+let prefixMap = {
+  set: 'put',
+  activate: 'put',
+  deactivate: 'put',
   delete: 'delete'
 };
+
+function getMethodAndPath(name) {
+  let path, method, prefixes;
+
+  prefixes = Object.keys(replaceMap);
+
+  for (let prefix of prefixes) {
+    if (name === prefix) {
+      path = '';
+      method = replaceMap[prefix];
+    } else if (name.startsWith(prefix)) {
+      path = '/' + _.snakeCase(name.replace(prefix, ''));
+      method = replaceMap[prefix];
+    } else {
+      continue;
+    }
+
+    return [path, method];
+  }
+
+  prefixes = Object.keys(prefixMap);
+
+  for (let prefix of prefixes) {
+    if (name.startsWith(prefix)) {
+      path = '/' + _.snakeCase(name);
+      method = prefixMap[prefix];
+      return [path, method];
+    }
+  }
+
+  return ['/' + _.snakeCase(name), 'post'];
+}
 
 class Router {
   constructor(ctrls, defaults = {}) {
@@ -30,7 +77,7 @@ class Router {
       method: 'post'
     };
     this.routes = [];
-    this.ctrls = ctrls || {};
+    this.ctrls = ctrls || [];
 
     Object.assign(this.defaults, defaults);
 
@@ -71,12 +118,9 @@ class Router {
 
   _generateConfig() {
     let { ctrls, routes, defaults } = this;
-    let ctrlsNames = Object.keys(ctrls);
 
-    ctrlsNames.forEach( path => {
-      let ctrl = ctrls[path];
-
-      path = path.replace(/\./g, '/');
+    for (let ctrl of ctrls) {
+      let path = getPathByName(ctrl.name);
 
       if (typeof(ctrl) !== 'function') {
         throw log.error('controller is not a constructor', ctrl);
@@ -100,17 +144,15 @@ class Router {
         let handler = proto[method];
         let route = {
           url: defaults.pathPrefix + path,
-          args: getParamNames(handler),
+          args: getParamNames(handler) || [],
           controller: ctrl,
           handler: method
         };
 
-        if (methodMap[method]) {
-          route.method = methodMap[method];
-        } else {
-          route.method = 'post';
-          route.url += '/' + method;
-        }
+        let [routePath, routeMethod] = getMethodAndPath(method);
+
+        route.url += routePath;
+        route.method = routeMethod;
 
         if (~route.args.indexOf('id')) {
           route.url += '/:id';
@@ -118,8 +160,7 @@ class Router {
 
         routes.push(route);
       });
-
-    });
+    }
   }
 
   _collectArgs(req, method, args) {
