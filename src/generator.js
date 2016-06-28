@@ -1,16 +1,37 @@
 let Promise = require('bluebird');
 let _ = require('lodash');
 
-function getPathByName(ctrlName) {
-  return _.snakeCase(ctrlName.replace(/Ctrl$/, '').replace(/Controller$/, ''));
+function getPathByName(ctrl) {
+  return _.snakeCase(getControllerName(ctrl));
 }
 
-function getParamNames(fn) {
-  var funStr = fn.toString();
-  return funStr.slice(funStr.indexOf('(') + 1, funStr.indexOf(')')).match(/([^\s,]+)/g);
+function haveId(name) {
+  for (let prefix of idPrefixList) {
+    if (name.startsWith(prefix) && name !== 'getAll') {
+      return true;
+    }
+  }
 }
 
-let moduleName = 'express-api-generator';
+function getControllerName(ctrl) {
+  return ctrl.name.replace(/Ctrl$/, '').replace(/Controller$/, '');
+}
+
+function getControllerMethods(ctrl) {
+  let proto = ctrl.prototype;
+  let methods = [];
+
+  do {
+    methods.push(...Object.getOwnPropertyNames(proto));
+  } while ((proto = proto.__proto__) && proto !== Object.prototype)
+
+  methods = _.uniq(methods);
+  _.pull(methods, ['init', 'constructor']);
+
+  return methods;
+}
+
+let moduleName = 'express-apigen';
 
 let log = {
   info: (...args) => console.log(moduleName + ':', ...args),
@@ -33,10 +54,12 @@ let replaceMap = {
 
 let prefixMap = {
   set: 'put',
-  activate: 'put',
-  deactivate: 'put',
-  delete: 'delete'
+  delete: 'delete',
+  add: 'post',
+  remove: 'delete'
 };
+
+let idPrefixList = ['set', 'get', 'delete', 'update'];
 
 function getMethodAndPath(name) {
   let path, method, prefixes;
@@ -79,6 +102,10 @@ class Router {
     this.routes = [];
     this.ctrls = ctrls || [];
 
+    if (defaults.Logger) {
+      log = new defaults.Logger(moduleName);
+    }
+
     Object.assign(this.defaults, defaults);
 
     this._generateConfig();
@@ -90,22 +117,37 @@ class Router {
         throw log.error('method not found', { method: route.method });
       }
 
-      log.info('route', route.method + ':' + route.url, '->', route.controller.name + '.' + route.handler + '(' + route.args.join(',') + ')');
+      log.info('route', _.padRight(_.padLeft(route.method, 6, ' ') + ':' + route.url, 40, ' '), '->', getControllerName(route.ctrl) + '.' + route.handler + '(' + (route.id ? 'id, ' : '') + 'data)');
 
-      app[route.method](route.url, (req, res) => {
-        let ctrl = new route.controller(req, res);
-        let args = this._collectArgs(req, route.method, args);
+      app[route.method](route.url, async (req, res) => {
+        let ctrl = new route.ctrl(req, res);
+        let data = this._collectData(req, route.method);
+        let args = [data];
+
+        if (route.id) {
+          args.unshift(req.params.id);
+          ctrl._id = req.params.id;
+        }
+
+        ctrl._method = route.method;
+        ctrl._data = data;
+
+        if (ctrl.init) {
+          await ctrl.init();
+        }
 
         Promise.resolve()
+          .then( () => ctrl.init ? ctrl.init() : undefined )
           .then( () => {
             return ctrl[route.handler](...args);
           })
           .catch( error => {
             if (error.stack) {
-              res.statusCode(500);
-              res.json({ error });
+              //res.sendStatus(500);
+              log.error(error.stack);
+              res.json({ error: 'internal error' });
             } else {
-              res.statusCode(400);
+              //res.sendStatus(400);
               res.json({ error });
             }
           })
@@ -120,14 +162,19 @@ class Router {
     let { ctrls, routes, defaults } = this;
 
     for (let ctrl of ctrls) {
-      let path = getPathByName(ctrl.name);
+      if (!ctrl.name) {
+        log.error('invalid controller', ctrl);
+        continue;
+      }
+
+      let path = getPathByName(ctrl);
 
       if (typeof(ctrl) !== 'function') {
         throw log.error('controller is not a constructor', ctrl);
       }
 
       let proto = ctrl.prototype;
-      let methods = Object.getOwnPropertyNames(proto);
+      let methods = getControllerMethods(ctrl);
 
       if (~methods.indexOf('constructor')) {
         methods.splice(methods.indexOf('constructor'), 1);
@@ -136,16 +183,19 @@ class Router {
       methods = methods.filter( method => method.charAt(0) !== '_' );
 
       if (!methods.length) {
-        log.warn('controller doesn\'t have methods', ctrl);
-        return;
+        log.info('controller doesn\'t have methods', ctrl);
+        continue;
       }
+
+      let ctrlName = getControllerName(ctrl);
 
       methods.forEach( method => {
         let handler = proto[method];
         let route = {
           url: defaults.pathPrefix + path,
-          args: getParamNames(handler) || [],
-          controller: ctrl,
+          id: haveId(method),
+          ctrl: ctrl,
+          ctrlName: ctrlName,
           handler: method
         };
 
@@ -154,7 +204,7 @@ class Router {
         route.url += routePath;
         route.method = routeMethod;
 
-        if (~route.args.indexOf('id')) {
+        if (route.id) {
           route.url += '/:id';
         }
 
@@ -163,18 +213,8 @@ class Router {
     }
   }
 
-  _collectArgs(req, method, args) {
-    return args.map( name => {
-      if (name === 'id') {
-        return req.params.id;
-      }
-
-      if (method === 'get') {
-        return req.query[name];
-      } else {
-        return req.body[name];
-      }
-    });
+  _collectData(req, method) {
+    return method === 'post' || method === 'update' ? req.body : req.query;
   }
 
   static setLogger(logger) {
